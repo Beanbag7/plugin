@@ -9,6 +9,14 @@ entry({"admin","network","shanxun","settings"}, cbi("shanxun"), _("设置"), 2).
 entry({"admin","network","shanxun","action"}, call("do_action")).leaf = true
 end
 
+local function exec_bg(cmd)
+  local ok, exit, code = os.execute(cmd)
+  if ok == true then return true end
+  if type(ok) == "number" and ok == 0 then return true end
+  if exit == 0 or code == 0 then return true end
+  return false
+end
+
 function do_action()
 local http = require "luci.http"
 local uci = require "luci.model.uci".cursor()
@@ -16,14 +24,16 @@ local m = http.formvalue("m") or ""
 local iface = uci:get("shanxun","config","iface") or "wan"
 local ok = false
 
+if not iface:match("^[%w%-]+$") then iface = "wan" end
+
 if m == "refresh" then
-ok = (os.execute("/usr/bin/shanxun-autodial refresh >/dev/null 2>&1 &") == 0)
+ok = exec_bg("/usr/bin/shanxun-autodial refresh >/dev/null 2>&1 &")
 elseif m == "redial" then
-ok = (os.execute("ubus call network.interface."..iface.." up >/dev/null 2>&1 &") == 0)
+ok = exec_bg("ubus call network.interface."..iface.." up >/dev/null 2>&1 &")
 elseif m == "check" then
-ok = (os.execute("/usr/bin/shanxun-autodial once >/dev/null 2>&1 &") == 0)
+ok = exec_bg("/usr/bin/shanxun-autodial once >/dev/null 2>&1 &")
 elseif m == "uninstall" then
-ok = (os.execute("/usr/bin/shanxun-uninstall >/dev/null 2>&1 &") == 0)
+ok = exec_bg("/usr/bin/shanxun-uninstall >/dev/null 2>&1 &")
 else
 http.status(400, "bad request")
 http.write_json({ok=false, msg="unknown action"})
