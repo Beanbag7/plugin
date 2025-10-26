@@ -1,0 +1,293 @@
+#!/bin/sh
+# shanxun-autodial: PPPoE 自动拨号 + 短信取密 + 自动更新密码
+# 依赖：ubus, jsonfilter, sms-tool(/sms_tool), uci, logger
+
+UCI_BIN="${UCI_BIN:-/sbin/uci}"
+JSONFILTER_BIN="${JSONFILTER_BIN:-/usr/bin/jsonfilter}"
+UBUS_BIN="${UBUS_BIN:-/bin/ubus}"
+LOG_FALLBACK="/var/log/shanxun.log"
+STATE_FILE="/var/run/shanxun.state"
+CFG_NS="shanxun"
+CFG_SEC="shanxun.config"
+
+cfg_get() { $UCI_BIN -q get $CFG_SEC.$1 2>/dev/null; }
+
+log() {
+  local msg="$*"
+  local LOG_FILE="$(cfg_get log_file || echo "$LOG_FALLBACK")"
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+  echo "$(date '+%F %T') $msg" >> "$LOG_FILE"
+  logger -t shanxun "$msg"
+}
+
+load_cfg() {
+  ENABLED="$(cfg_get enabled || echo 1)"
+  IFACE="$(cfg_get iface || echo wan)"
+  SMS_DEV="$(cfg_get sms_device || echo /dev/ttyUSB2)"
+  SMS_BAUD="$(cfg_get sms_baud || echo 115200)"
+  SMS_NUM="$(cfg_get sms_number || echo 10000)"
+  SMS_TEXT="$(cfg_get sms_text || echo MM)"
+  SMS_SENDER_FILTER="$(cfg_get sms_sender_filter || echo '')"
+  PASS_RE="$(cfg_get password_regex || echo '密码[^0-9]*\([0-9]\{4,32\}\)')"
+  EXPIRY_RE="$(cfg_get expiry_regex || echo '\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\)')"
+  CHECK_INTERVAL="$(cfg_get check_interval || echo 30)"
+  DIAL_TIMEOUT="$(cfg_get dial_timeout || echo 20)"
+  RETRIES="$(cfg_get retries || echo 2)"
+  SMS_WAIT="$(cfg_get sms_wait || echo 60)"
+  LOG_FILE="$(cfg_get log_file || echo "$LOG_FALLBACK")"
+  SMS_SEND_CMD="$(cfg_get sms_send_cmd || echo '')"
+  SMS_RECV_CMD="$(cfg_get sms_recv_cmd || echo '')"
+ 
+  # --- BEGIN ENHANCEMENT: ServerChan ---
+  SC_KEY="$(cfg_get sc_key || echo '')"
+  # --- END ENHANCEMENT ---
+}
+
+
+# ... (在 load_cfg() } 之后, mask() 之前) ...
+
+# --- BEGIN ENHANCEMENT: ServerChan ---
+push_notification() {
+  local title="$1"
+  local msg="$2"
+  
+  # 1. 检查是否配置了 Key
+  [ -z "$SC_KEY" ] && return 1
+  
+  # 2. 检查是否安装了 curl
+  if ! command -v curl >/dev/null 2>&1; then
+    log "ServerChan 推送失败：未安装 curl"
+    return 1
+  fi
+  
+  log "正在推送通知到 ServerChan..."
+  
+  # 3. 使用 --data-urlencode 确保特殊字符被正确编码
+  #    使用 -s (silent) 隐藏进度条, -o /dev/null 丢弃输出
+  log "ServerChanKey：$SC_KEY"
+  curl -s -X POST "https://sctapi.ftqq.com/${SC_KEY}.send" \
+    --data-urlencode "title=$title" \
+    --data-urlencode "desp=$msg" \
+    -o /dev/null
+    
+  if [ $? -eq 0 ]; then
+    log "ServerChan 推送成功"
+  else
+    log "ServerChan 推送失败 (curl 退出码: $?)"
+  fi
+}
+# --- END ENHANCEMENT ---
+
+mask() { echo "$1" | sed 's/^\(..\).*/\1*******/'; }
+
+is_up() {
+  local status="$($UBUS_BIN call network.interface.$IFACE status 2>/dev/null || echo '{}')"
+  local up="$(echo "$status" | $JSONFILTER_BIN -e '@.up' 2>/dev/null)"
+  [ "$up" = "true" ]
+}
+
+dial_up() {
+  log "尝试拨号: 接口=$IFACE"
+  $UBUS_BIN call network.interface.$IFACE up >/dev/null 2>&1 || ifup "$IFACE" >/dev/null 2>&1
+  sleep "$DIAL_TIMEOUT"
+  if is_up; then
+    log "拨号成功"
+    return 0
+  else
+    log "拨号未成功"
+    return 1
+  fi
+}
+
+send_sms() {
+  local num="$SMS_NUM" txt="$SMS_TEXT"
+  if [ -n "$SMS_SEND_CMD" ]; then
+	SMS_SEND_CMD=$(echo "$SMS_SEND_CMD" | tr -d '\r\n')
+	SMS_DEV=$(echo "$SMS_DEV" | tr -d '\r\n')
+	SMS_BAUD=$(echo "$SMS_BAUD" | tr -d '\r\n')
+	num=$(echo "$num" | tr -d '\r\n')
+	txt=$(echo "$txt" | tr -d '\r\n')
+	
+    local CMD
+	log "当前命令：$SMS_SEND_CMD"
+	log "当前设备：$SMS_DEV"
+	log "当前波特率：$SMS_BAUD"
+	log "当前目标号码：$num"
+	log "当前发送内容：$txt"
+    CMD=$(echo "$SMS_SEND_CMD" | sed -e "s|{dev}|$SMS_DEV|g" -e "s|"{num}"|$num|g" -e "s|{msg}|$txt|g")
+    log "发送短信(自定义): $CMD"
+    eval "$CMD"
+    return $?
+  fi
+  if command -v sms-tool >/dev/null 2>&1; then
+    log "发送短信: sms-tool -d $SMS_DEV -b $SMS_BAUD send $num \"$txt\""
+    sms-tool -d "$SMS_DEV" -b "$SMS_BAUD" send "$num" "$txt" >/dev/null 2>&1 && return 0
+  fi
+  if command -v sms_tool >/dev/null 2>&1; then
+    log "发送短信: sms_tool -d $SMS_DEV -b $SMS_BAUD -t $num -s \"$txt\""
+    sms_tool -d "$SMS_DEV" -b "$SMS_BAUD" -t "$num" -s "$txt" >/dev/null 2>&1 && return 0
+  fi
+  log "发送短信失败：请检查 sms-tool 是否安装、设备/波特率是否正确"
+  return 1
+}
+
+read_last_sms() {
+  # 输出最近短信正文（无法保证格式一致，因此解析时会做宽松匹配）
+  if [ -n "$SMS_RECV_CMD" ]; then
+	log "正在读取短信：$SMS_RECV_CMD"
+    local CMD
+    CMD=$(echo "$SMS_RECV_CMD" | sed -e "s|{dev}|$SMS_DEV|g" -e "s|{baud}|$SMS_BAUD|g")
+	log "读取短信命令是：$CMD"
+    eval "$CMD"
+    return 0
+  fi
+  if command -v sms-tool >/dev/null 2>&1; then
+    sms-tool -d "$SMS_DEV" -b "$SMS_BAUD" read --newest 2>/dev/null && return 0
+    sms-tool -d "$SMS_DEV" -b "$SMS_BAUD" recv 1 2>/dev/null && return 0
+    sms-tool -d "$SMS_DEV" -b "$SMS_BAUD" inbox 2>/dev/null && return 0
+  fi
+  if command -v sms_tool >/dev/null 2>&1; then
+    sms_tool -d "$SMS_DEV" -b "$SMS_BAUD" -R 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+parse_password_and_expiry() {
+  # 从 stdin 解析密码与有效期，输出 PASS= / EXPIRY=
+  local text; text="$(cat)"
+  local pass exp
+  log "短信内容：$PASS"
+  pass="$(echo "$text" | sed -n 's/.*密码是：[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+  log "解析的新密码：$pass"
+  [ -z "$pass" ] && pass="$(echo "$text" | grep -oE '[0-9]{4,32}' | head -n1)"
+  exp="$(echo "$text" | sed -n 's/.*\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\).*/\1/p' | head -n1)"
+  [ -n "$pass" ] && echo "PASS=$pass"
+  [ -n "$exp" ] && echo "EXPIRY=$exp"
+}
+
+request_new_password() {
+  log "通过短信获取最新密码：发送到 $SMS_NUM，内容=\"$SMS_TEXT\""
+  send_sms || return 1
+  log "短信已发送，等待回执(<=${SMS_WAIT}s)…"
+  local t=0 step=3 body text kv
+  while [ $t -lt $SMS_WAIT ]; do
+    body="$(read_last_sms 2>/dev/null || true)"
+	#--------------------------------------------------------
+	#log "消息体内容：$body"
+	#--------------------------------------------------------
+    [ -n "$body" ] || { sleep $step; t=$((t+step)); continue; }
+	
+    if [ -n "$SMS_SENDER_FILTER" ]; then
+	#--------------------------------------------------------
+	log "这里是过滤器：$SMS_SENDER_FILTER"
+	#--------------------------------------------------------
+      echo "$body" | grep -q "$SMS_SENDER_FILTER" || { sleep $step; t=$((t+step)); continue; }
+    fi
+
+    text="$(echo "$body" | tail -n 100)"  # 去掉可能的标题行，只保留正文尾部
+    kv="$(echo "$text" | parse_password_and_expiry)"
+    NEW_PASS="$(echo "$kv" | sed -n 's/^PASS=//p' | head -n1)"
+    NEW_EXPIRY="$(echo "$kv" | sed -n 's/^EXPIRY=//p' | head -n1)"
+
+    if [ -n "$NEW_PASS" ]; then
+      log "解析到新密码: $(mask "$NEW_PASS") 有效期: ${NEW_EXPIRY:-未知}"
+      $UCI_BIN -q set shanxun.config.last_password="$NEW_PASS"
+      [ -n "$NEW_EXPIRY" ] && $UCI_BIN -q set shanxun.config.last_expiry="$NEW_EXPIRY"
+      $UCI_BIN -q set shanxun.config.last_sms_time="$(date '+%F %T')"
+      $UCI_BIN -q commit shanxun
+	  # --- BEGIN ENHANCEMENT: ServerChan ---
+      # 准备推送内容
+      local push_title="闪讯密码已更新"
+      local push_msg="新密码: ${NEW_PASS}
+	  有效期: ${NEW_EXPIRY:-未知}
+	  路由器: $(hostname)"
+      # 在后台执行推送 (&)，防止 curl 因网络不通而卡住主流程
+      push_notification "$push_title" "$push_msg" &
+      # --- END ENHANCEMENT ---
+      echo "NEW_PASS=$NEW_PASS"
+      echo "NEW_EXPIRY=$NEW_EXPIRY"
+      return 0
+    fi
+    sleep $step; t=$((t+step))
+  done
+  log "在 ${SMS_WAIT}s 内未收到可解析的含密码短信"
+  return 1
+}
+
+update_network_password() {
+  local pass="$1"
+  [ -z "$pass" ] && return 1
+  log "写入 PPPoE 密码到 network.$IFACE.password"
+  $UCI_BIN -q set network.$IFACE.password="$pass" && $UCI_BIN -q commit network
+  log "重启接口 $IFACE"
+  ifdown "$IFACE" >/dev/null 2>&1; sleep 2; ifup "$IFACE" >/dev/null 2>&1
+  sleep "$DIAL_TIMEOUT"
+  if is_up; then
+    log "更新密码后拨号成功"
+    return 0
+  else
+    log "更新密码后拨号仍未成功"
+    return 1
+  fi
+}
+
+once() {
+  load_cfg
+  [ "$ENABLED" = "1" ] || { log "功能未启用(enabled=0)，跳过一次检测"; return 0; }
+  if is_up; then
+    return 0
+  fi
+  log "检测到接口 $IFACE 未连接，开始重试拨号…"
+  local i=0
+  while [ $i -lt $RETRIES ]; do
+    dial_up && return 0
+    i=$((i+1))
+  done
+  log "多次重拨失败，尝试短信取回新密码"
+  if request_new_password; then
+    NEW_PASS="$(cfg_get last_password)"
+    update_network_password "$NEW_PASS" || true
+  else
+    log "短信取密失败，等待下次周期"
+  fi
+}
+
+loop() {
+  load_cfg
+  touch "$(cfg_get log_file || echo "$LOG_FALLBACK")" 2>/dev/null
+  log "shanxun-autodial 启动：iface=$IFACE interval=${CHECK_INTERVAL}s retries=$RETRIES sms_wait=${SMS_WAIT}s"
+  while true; do
+    once
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+status() {
+  load_cfg
+  local up="false" ip4="" lastpass lastexp lastsms
+  if is_up; then up="true"; fi
+  local j="$($UBUS_BIN call network.interface.$IFACE status 2>/dev/null || echo '{}')"
+  ip4="$(echo "$j" | $JSONFILTER_BIN -e '@.ipv4-address[0].address' 2>/dev/null)"
+  lastpass="$(cfg_get last_password)"
+  lastexp="$(cfg_get last_expiry)"
+  lastsms="$(cfg_get last_sms_time)"
+  echo "{"
+  echo "  \"iface\":\"$IFACE\","
+  echo "  \"up\":$up,"
+  echo "  \"ip4\":\"${ip4:-}\","
+  echo "  \"last_password_mask\":\"$(mask "$lastpass")\","
+  echo "  \"last_expiry\":\"${lastexp:-}\","
+  echo "  \"last_sms_time\":\"${lastsms:-}\","
+  echo "  \"check_interval\":$CHECK_INTERVAL,"
+  echo "  \"retries\":$RETRIES"
+  echo "}"
+}
+
+case "$1" in
+  once|--once) once ;;
+  refresh|--refresh) load_cfg; request_new_password && update_network_password "$(cfg_get last_password)" ;;
+  status|--status) status ;;
+  parse|--parse) parse_password_and_expiry ;;  # 用法示例：echo "尊敬的闪讯用户..." | /usr/bin/shanxun-autodial parse
+  loop|"" ) loop ;;
+  *) echo "用法: $0 [loop|once|refresh|status|parse]"; exit 1 ;;
+esac
