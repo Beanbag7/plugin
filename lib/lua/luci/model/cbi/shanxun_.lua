@@ -124,7 +124,7 @@ function o.cfgvalue(self, section)
   local pass = uci:get("shanxun","config","last_password") or ""
   local exp  = uci:get("shanxun","config","last_expiry") or ""
   local t    = uci:get("shanxun","config","last_sms_time") or ""
-  local shown = (pass ~= "" and (pass:gsub("^(..).*","%1*******")) or "-")
+  local shown = pass or "-"
   return string.format("密码：%s / 有效期：%s / 收到：%s", shown, (exp ~= "" and exp or "-"), (t ~= "" and t or "-"))
 end
 
