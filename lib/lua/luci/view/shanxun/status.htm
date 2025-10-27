@@ -14,45 +14,13 @@
   </div>
 
   <h3>最近日志（20 行）</h3>
-  <pre style="max-height:320px;overflow:auto;"><%
-    local uci = require "luci.model.uci".cursor()
-    local log_file = uci:get_first("shanxun", "config", "log_file") or "/var/log/shanxun.log"
-
-    -- 验证路径，只允许安全字符，并禁止 ".."
-    if not log_file:match("^[a-zA-Z0-9_./-]+$") or log_file:match("%.%.") then
-        log_file = "/var/log/shanxun.log" -- 验证失败则回退
-    end
-
-    -- 使用单引号安全地将路径作为参数传递
-    local cmd = "tail -n 20 '" .. log_file .. "' 2>/dev/null"
-    write(luci.sys.exec(cmd))
-  %></pre>
-  </div>
+  <pre style="max-height:320px;overflow:auto;"><%=luci.sys.exec("tail -n 20 $(uci -q get shanxun.config.log_file 2>/dev/null || echo /var/log/shanxun.log) 2>/dev/null")%></pre>
+</div>
 
 <script>
 function sxAct(m){
-  var el = document.getElementById('sx-status');
-  if (el) {
-    el.innerHTML = '<pre id="sx-json" style="white-space:pre-wrap;word-break:break-all;">正在执行 "' + m + '" 操作...</pre>';
-  }
-
-  var url = '<%=luci.dispatcher.build_url("admin","network","shanxun","action")%>?m='+m;
-  
-  fetch(url, {method:'GET'})
-    .then(r => r.json())
-    .then(d => {
-      if (m === 'uninstall' && d.ok) {
-        alert('卸载成功，正在跳转到网络页面...');
-        location.href = '<%=luci.dispatcher.build_url("admin","network")%>';
-      } else {
-        // 延迟1.5秒刷新，让后台任务有时间启动和刷新状态
-        setTimeout(function() { location.reload() }, 1500);
-      }
-    })
-    .catch(e => {
-      alert('操作失败: ' + e);
-      location.reload();
-    });
+  fetch('<%=luci.dispatcher.build_url("admin","network","shanxun","action")%>?m='+m, {method:'GET'})
+    .then(r => r.json()).then(_ => location.reload());
 }
 </script>
 <%+footer%>
